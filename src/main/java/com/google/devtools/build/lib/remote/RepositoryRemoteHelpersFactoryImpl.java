@@ -31,7 +31,6 @@ class RepositoryRemoteHelpersFactoryImpl implements RepositoryRemoteHelpersFacto
 
   private final String remoteInstanceName;
   private final boolean acceptCached;
-  private final boolean uploadLocalResults;
   private final boolean verboseFailures;
 
   RepositoryRemoteHelpersFactoryImpl(
@@ -42,7 +41,6 @@ class RepositoryRemoteHelpersFactoryImpl implements RepositoryRemoteHelpersFacto
       String commandId,
       String remoteInstanceName,
       boolean acceptCached,
-      boolean uploadLocalResults,
       boolean verboseFailures) {
     this.directories = directories;
     this.cache = cache;
@@ -51,7 +49,6 @@ class RepositoryRemoteHelpersFactoryImpl implements RepositoryRemoteHelpersFacto
     this.commandId = commandId;
     this.remoteInstanceName = remoteInstanceName;
     this.acceptCached = acceptCached;
-    this.uploadLocalResults = uploadLocalResults;
     this.verboseFailures = verboseFailures;
   }
 
@@ -80,7 +77,6 @@ class RepositoryRemoteHelpersFactoryImpl implements RepositoryRemoteHelpersFacto
         buildRequestId,
         commandId,
         acceptCached,
-        uploadLocalResults,
         verboseFailures);
   }
 }

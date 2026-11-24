@@ -136,7 +136,6 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
   private final String buildRequestId;
   private final String commandId;
   private final boolean acceptCached;
-  private final boolean uploadLocalResults;
   private final boolean verboseFailures;
   private final Action baseAction;
   private final Digest commandDigest;
@@ -147,14 +146,12 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
       String buildRequestId,
       String commandId,
       boolean acceptCached,
-      boolean uploadLocalResults,
       boolean verboseFailures) {
     this.directories = directories;
     this.cache = cache;
     this.buildRequestId = buildRequestId;
     this.commandId = commandId;
     this.acceptCached = acceptCached;
-    this.uploadLocalResults = uploadLocalResults;
     this.verboseFailures = verboseFailures;
     this.baseAction =
         Action.newBuilder()
@@ -176,10 +173,7 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
     if (!(fetchedRepoDir.getFileSystem() instanceof RemoteExternalOverlayFileSystem remoteFs)) {
       return;
     }
-    var context = buildContext(repoName, CacheOp.UPLOAD);
-    if (!context.getWriteCachePolicy().allowRemoteCache()) {
-      return;
-    }
+    var context = buildContext(repoName);
     ImmutableList<RepoRecordedInput.WithValue> recordedInputValues;
     String markerFileContent;
     try {
@@ -281,7 +275,7 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
       return false;
     }
 
-    var context = buildContext(repoName, CacheOp.DOWNLOAD);
+    var context = buildContext(repoName);
     if (!context.getReadCachePolicy().allowRemoteCache()) {
       return false;
     }
@@ -346,25 +340,15 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
     return Profiler.instance().profile(ProfilerTask.REPO_CONTENTS_CACHE, () -> phase + ": " + repo);
   }
 
-  private enum CacheOp {
-    DOWNLOAD,
-    UPLOAD,
-  }
-
-  private RemoteActionExecutionContext buildContext(RepositoryName repoName, CacheOp cacheOp) {
+  private RemoteActionExecutionContext buildContext(RepositoryName repoName) {
     var metadata =
         TracingMetadataUtils.buildMetadata(buildRequestId, commandId, repoName.getName());
-    // Don't upload local repo contents to the disk cache as the (local) `--repo_contents_cache` is
-    // a better alternative for local caching. Do write through the disk cache for downloads from
-    // the remote cache to speed up future usage.
+    // Fetched repos are stored in every configured cache, whatever --remote_upload_local_results
+    // says about action results: a lookup can only hit if some client stored the repo, and with
+    // only a disk cache this client is the only one there is.
     return RemoteActionExecutionContext.create(metadata)
         .withReadCachePolicy(acceptCached ? CachePolicy.ANY_CACHE : CachePolicy.NO_CACHE)
-        .withWriteCachePolicy(
-            switch (cacheOp) {
-              case DOWNLOAD -> CachePolicy.ANY_CACHE;
-              case UPLOAD ->
-                  uploadLocalResults ? CachePolicy.REMOTE_CACHE_ONLY : CachePolicy.NO_CACHE;
-            });
+        .withWriteCachePolicy(CachePolicy.ANY_CACHE);
   }
 
   private Action buildAction(String inputHash) {

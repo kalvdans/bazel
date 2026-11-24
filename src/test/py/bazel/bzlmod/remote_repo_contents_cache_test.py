@@ -15,6 +15,7 @@
 # pylint: disable=g-long-ternary
 # pylint: disable=g-bad-todo
 
+import hashlib
 import os
 import tempfile
 from absl.testing import absltest
@@ -74,6 +75,120 @@ class RemoteRepoContentsCacheTest(
     ])
     self.assertIn('JUST FETCHED', '\n'.join(stderr))
     self.assertTrue(os.path.exists(os.path.join(repo_dir, 'BUILD')))
+
+  def _ScratchReproducibleRepo(self):
+    self.ScratchFile(
+        'MODULE.bazel',
+        [
+            'repo = use_repo_rule("//:repo.bzl", "repo")',
+            'repo(name = "my_repo")',
+        ],
+    )
+    self.ScratchFile('BUILD.bazel')
+    self.ScratchFile(
+        'repo.bzl',
+        [
+            'def _repo_impl(rctx):',
+            '  rctx.file("BUILD", "filegroup(name=\'haha\')")',
+            '  print("JUST FETCHED")',
+            '  return rctx.repo_metadata(reproducible=True)',
+            'repo = repository_rule(_repo_impl)',
+        ],
+    )
+
+  def testCachedWithoutUploadingLocalResults(self):
+    self._ScratchReproducibleRepo()
+    repo_dir = self.RepoDir('my_repo')
+    build = ['build', '@my_repo//:haha', '--noremote_upload_local_results']
+
+    _, _, stderr = self.RunBazel(build)
+    self.assertIn('JUST FETCHED', '\n'.join(stderr))
+
+    self.RunBazel(['clean', '--expunge'])
+    _, _, stderr = self.RunBazel(build)
+    self.assertNotIn('JUST FETCHED', '\n'.join(stderr))
+    self.assertFalse(os.path.exists(os.path.join(repo_dir, 'BUILD')))
+
+  def testCachedInDiskCacheWithoutRemoteCache(self):
+    self._ScratchReproducibleRepo()
+    repo_dir = self.RepoDir('my_repo')
+    disk_cache = tempfile.mkdtemp(dir=os.environ['TEST_TMPDIR'])
+    build = [
+        'build',
+        '@my_repo//:haha',
+        '--remote_cache=',
+        '--disk_cache=' + disk_cache,
+    ]
+
+    _, _, stderr = self.RunBazel(build)
+    self.assertIn('JUST FETCHED', '\n'.join(stderr))
+
+    self.RunBazel(['clean', '--expunge'])
+    _, _, stderr = self.RunBazel(build)
+    self.assertNotIn('JUST FETCHED', '\n'.join(stderr))
+    self.assertFalse(os.path.exists(os.path.join(repo_dir, 'BUILD')))
+
+  def testDiskCacheServesActionAfterSourceIsEvicted(self):
+    self.ScratchFile(
+        'MODULE.bazel',
+        [
+            'repo = use_repo_rule("//:repo.bzl", "repo")',
+            'repo(name = "my_repo")',
+        ],
+    )
+    self.ScratchFile('BUILD.bazel')
+    self.ScratchFile(
+        'repo.bzl',
+        [
+            'def _repo_impl(rctx):',
+            '  rctx.file("BUILD", "exports_files([\'data.txt\'])")',
+            '  rctx.file("data.txt", "hello source")',
+            '  print("JUST FETCHED")',
+            '  return rctx.repo_metadata(reproducible=True)',
+            'repo = repository_rule(_repo_impl)',
+        ],
+    )
+    self.ScratchFile(
+        'main/BUILD.bazel',
+        [
+            'genrule(',
+            '  name = "use_data",',
+            '  srcs = ["@my_repo//:data.txt"],',
+            '  outs = ["out.txt"],',
+            '  cmd = "tr a-z A-Z < $< > $@",',
+            ')',
+        ],
+    )
+    repo_dir = self.RepoDir('my_repo')
+    disk_cache = tempfile.mkdtemp(dir=os.environ['TEST_TMPDIR'])
+    build = [
+        'build',
+        '//main:use_data',
+        '--remote_cache=',
+        '--disk_cache=' + disk_cache,
+    ]
+
+    _, _, stderr = self.RunBazel(build)
+    self.assertIn('JUST FETCHED', '\n'.join(stderr))
+
+    # Evict the repo's source file from the disk cache. What remains is the
+    # repo's record of file digests and the result of the action that read it.
+    source_digest = hashlib.sha256(b'hello source').hexdigest()
+    source_blob = os.path.join(
+        disk_cache, 'cas', source_digest[:2], source_digest
+    )
+    self.assertTrue(os.path.exists(source_blob))
+    os.remove(source_blob)
+
+    # The action is still served from the cache, by the digests in that record,
+    # without fetching the repo or reading the source file.
+    self.RunBazel(['clean', '--expunge'])
+    _, _, stderr = self.RunBazel(build)
+    self.assertNotIn('JUST FETCHED', '\n'.join(stderr))
+    self.assertFalse(os.path.exists(os.path.join(repo_dir, 'data.txt')))
+    self.assertFalse(os.path.exists(source_blob))
+    with open(self.Path('bazel-bin/main/out.txt')) as f:
+      self.assertEqual(f.read(), 'HELLO SOURCE')
 
   def testNonUtf8RepositoryPathsAreRefetched(self):
     if not self.IsLinux():
