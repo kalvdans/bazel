@@ -128,7 +128,7 @@ class RemoteRepoContentsCacheTest(
     self.assertNotIn('JUST FETCHED', '\n'.join(stderr))
     self.assertFalse(os.path.exists(os.path.join(repo_dir, 'BUILD')))
 
-  def testDiskCacheServesActionAfterSourceIsEvicted(self):
+  def _ScratchRepoWithSourceFile(self):
     self.ScratchFile(
         'MODULE.bazel',
         [
@@ -152,43 +152,61 @@ class RemoteRepoContentsCacheTest(
         'main/BUILD.bazel',
         [
             'genrule(',
-            '  name = "use_data",',
+            '  name = "upper",',
             '  srcs = ["@my_repo//:data.txt"],',
-            '  outs = ["out.txt"],',
+            '  outs = ["upper.txt"],',
             '  cmd = "tr a-z A-Z < $< > $@",',
+            ')',
+            'genrule(',
+            '  name = "copy",',
+            '  srcs = ["@my_repo//:data.txt"],',
+            '  outs = ["copy.txt"],',
+            '  cmd = "cat $< > $@",',
             ')',
         ],
     )
+
+  def testDiskCacheServesActionWithoutStoringSources(self):
+    self._ScratchRepoWithSourceFile()
     repo_dir = self.RepoDir('my_repo')
     disk_cache = tempfile.mkdtemp(dir=os.environ['TEST_TMPDIR'])
-    build = [
-        'build',
-        '//main:use_data',
-        '--remote_cache=',
-        '--disk_cache=' + disk_cache,
-    ]
+    flags = ['--remote_cache=', '--disk_cache=' + disk_cache]
 
-    _, _, stderr = self.RunBazel(build)
+    _, _, stderr = self.RunBazel(['build', '//main:upper'] + flags)
     self.assertIn('JUST FETCHED', '\n'.join(stderr))
 
-    # Evict the repo's source file from the disk cache. What remains is the
-    # repo's record of file digests and the result of the action that read it.
+    # The disk cache holds the repo's record of file digests, but not the
+    # contents of its source file.
     source_digest = hashlib.sha256(b'hello source').hexdigest()
     source_blob = os.path.join(
         disk_cache, 'cas', source_digest[:2], source_digest
     )
-    self.assertTrue(os.path.exists(source_blob))
-    os.remove(source_blob)
+    self.assertFalse(os.path.exists(source_blob))
 
-    # The action is still served from the cache, by the digests in that record,
-    # without fetching the repo or reading the source file.
+    # The cached action is still served, by the digests in that record, without
+    # fetching the repo.
     self.RunBazel(['clean', '--expunge'])
-    _, _, stderr = self.RunBazel(build)
+    _, _, stderr = self.RunBazel(['build', '//main:upper'] + flags)
     self.assertNotIn('JUST FETCHED', '\n'.join(stderr))
     self.assertFalse(os.path.exists(os.path.join(repo_dir, 'data.txt')))
-    self.assertFalse(os.path.exists(source_blob))
-    with open(self.Path('bazel-bin/main/out.txt')) as f:
+    with open(self.Path('bazel-bin/main/upper.txt')) as f:
       self.assertEqual(f.read(), 'HELLO SOURCE')
+
+  def testDiskCacheRefetchesRepoWhenActionHasToRun(self):
+    self._ScratchRepoWithSourceFile()
+    disk_cache = tempfile.mkdtemp(dir=os.environ['TEST_TMPDIR'])
+    flags = ['--remote_cache=', '--disk_cache=' + disk_cache]
+
+    _, _, stderr = self.RunBazel(['build', '//main:upper'] + flags)
+    self.assertIn('JUST FETCHED', '\n'.join(stderr))
+
+    # An action that was never built has to run and needs the source file,
+    # which only a new fetch can provide.
+    self.RunBazel(['clean', '--expunge'])
+    _, _, stderr = self.RunBazel(['build', '//main:copy'] + flags)
+    self.assertIn('JUST FETCHED', '\n'.join(stderr))
+    with open(self.Path('bazel-bin/main/copy.txt')) as f:
+      self.assertEqual(f.read(), 'hello source')
 
   def testNonUtf8RepositoryPathsAreRefetched(self):
     if not self.IsLinux():

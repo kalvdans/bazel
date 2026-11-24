@@ -136,6 +136,7 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
   private final String buildRequestId;
   private final String commandId;
   private final boolean acceptCached;
+  private final boolean uploadLocalResults;
   private final boolean verboseFailures;
   private final Action baseAction;
   private final Digest commandDigest;
@@ -146,12 +147,14 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
       String buildRequestId,
       String commandId,
       boolean acceptCached,
+      boolean uploadLocalResults,
       boolean verboseFailures) {
     this.directories = directories;
     this.cache = cache;
     this.buildRequestId = buildRequestId;
     this.commandId = commandId;
     this.acceptCached = acceptCached;
+    this.uploadLocalResults = uploadLocalResults;
     this.verboseFailures = verboseFailures;
     this.baseAction =
         Action.newBuilder()
@@ -173,7 +176,7 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
     if (!(fetchedRepoDir.getFileSystem() instanceof RemoteExternalOverlayFileSystem remoteFs)) {
       return;
     }
-    var context = buildContext(repoName);
+    var context = buildContext(repoName, CachePolicy.ANY_CACHE);
     ImmutableList<RepoRecordedInput.WithValue> recordedInputValues;
     String markerFileContent;
     try {
@@ -217,7 +220,30 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
       }
       ActionResult result;
       try (var span = profile(repoName, "Upload repository contents")) {
-        result = manifest.upload(context, cache, reporter, /* force= */ false);
+        if (uploadLocalResults) {
+          manifest.upload(
+              buildContext(repoName, CachePolicy.REMOTE_CACHE_ONLY),
+              cache,
+              reporter,
+              /* force= */ false);
+        }
+        // Everywhere else, only the record of the repo is stored: the digests of its files, and
+        // of the files themselves just those that Bazel reads while loading packages. That is
+        // enough to look up every action that uses the repo. A file that is missing when an
+        // action has to run is handled like any other file the cache has lost, by fetching the
+        // repo again.
+        manifest
+            .getDigestToFile()
+            .values()
+            .removeIf(file -> file.startsWith(fetchedRepoDir) && !isReadWhileLoading(file));
+        result =
+            manifest.upload(
+                buildContext(
+                    repoName,
+                    uploadLocalResults ? CachePolicy.DISK_CACHE_ONLY : CachePolicy.ANY_CACHE),
+                cache,
+                reporter,
+                /* force= */ false);
       }
       // Relative repository-root symlinks have no directory Tree to install.
       if (result.getOutputDirectoriesCount() != 1) {
@@ -275,7 +301,7 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
       return false;
     }
 
-    var context = buildContext(repoName);
+    var context = buildContext(repoName, CachePolicy.ANY_CACHE);
     if (!context.getReadCachePolicy().allowRemoteCache()) {
       return false;
     }
@@ -340,15 +366,23 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
     return Profiler.instance().profile(ProfilerTask.REPO_CONTENTS_CACHE, () -> phase + ": " + repo);
   }
 
-  private RemoteActionExecutionContext buildContext(RepositoryName repoName) {
+  /** Whether Bazel itself reads {@code file} of a repo while loading its packages. */
+  private static boolean isReadWhileLoading(Path file) {
+    String name = file.getBaseName();
+    return name.endsWith(".bzl")
+        || name.equals("BUILD")
+        || name.equals("BUILD.bazel")
+        || name.equals("REPO.bazel")
+        || name.equals("MODULE.bazel");
+  }
+
+  private RemoteActionExecutionContext buildContext(
+      RepositoryName repoName, CachePolicy writePolicy) {
     var metadata =
         TracingMetadataUtils.buildMetadata(buildRequestId, commandId, repoName.getName());
-    // Fetched repos are stored in every configured cache, whatever --remote_upload_local_results
-    // says about action results: a lookup can only hit if some client stored the repo, and with
-    // only a disk cache this client is the only one there is.
     return RemoteActionExecutionContext.create(metadata)
         .withReadCachePolicy(acceptCached ? CachePolicy.ANY_CACHE : CachePolicy.NO_CACHE)
-        .withWriteCachePolicy(CachePolicy.ANY_CACHE);
+        .withWriteCachePolicy(writePolicy);
   }
 
   private Action buildAction(String inputHash) {
